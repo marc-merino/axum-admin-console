@@ -1,7 +1,8 @@
 //! The console mounted over a small library schema (`tests/migrations`):
 //! integer-keyed authors, UUID-keyed books, text-keyed tags, books tagged
-//! many-to-many and reviews that protect their book. Who is asking comes
-//! from a `who` cookie; the history hook writes `console_history`.
+//! many-to-many, authors contributing to books many-to-many and reviews that
+//! protect their book. Who is asking comes from a `who` cookie; the history
+//! hook writes `console_history`.
 
 use axum::{
     Router,
@@ -61,16 +62,28 @@ static BOOK: Model = Model::new("library", "book", "library_book", "book", "book
         Field::fk("author", "author_id", "Author", "library_author"),
         Field::fk("editor", "editor_id", "Editor", "library_author").null(),
     ])
-    .m2m(&[ManyToMany {
-        name: "tags",
-        label: "Tags",
-        through: "library_book_tags",
-        own: "book_id",
-        other: "tag_id",
-        target: "library_tag",
-        options_sql: "SELECT code, label FROM library_tag ORDER BY label",
-        help: "",
-    }])
+    .m2m(&[
+        ManyToMany {
+            name: "tags",
+            label: "Tags",
+            through: "library_book_tags",
+            own: "book_id",
+            other: "tag_id",
+            target: "library_tag",
+            options_sql: "SELECT code, label FROM library_tag ORDER BY label",
+            help: "",
+        },
+        ManyToMany {
+            name: "contributors",
+            label: "Contributors",
+            through: "library_book_contributors",
+            own: "book_id",
+            other: "author_id",
+            target: "library_author",
+            options_sql: "SELECT id, name FROM library_author ORDER BY name",
+            help: "",
+        },
+    ])
     .computed(&[Computed {
         name: "key_text",
         label: "Key",
@@ -85,6 +98,7 @@ static BOOK: Model = Model::new("library", "book", "library_book", "book", "book
             "author",
             "editor",
             "tags",
+            "contributors",
             "key_text",
         ],
     )])
@@ -183,6 +197,18 @@ static RELATIONS: &[Relation] = &[
         "library_book_tags",
         "tag_id",
         "library_tag",
+        OnDelete::Cascade,
+    ),
+    (
+        "library_book_contributors",
+        "book_id",
+        "library_book",
+        OnDelete::Cascade,
+    ),
+    (
+        "library_book_contributors",
+        "author_id",
+        "library_author",
         OnDelete::Cascade,
     ),
     (
@@ -650,6 +676,44 @@ async fn tag_book(db: &PgPool, book: Uuid, code: &str) {
         .unwrap();
 }
 
+async fn contribute(db: &PgPool, book: Uuid, author: i64) {
+    sqlx::query("INSERT INTO library_book_contributors (book_id, author_id) VALUES ($1, $2)")
+        .bind(book)
+        .bind(author)
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+async fn contributors(db: &PgPool, book: Uuid) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT author_id FROM library_book_contributors WHERE book_id = $1 ORDER BY author_id",
+    )
+    .bind(book)
+    .fetch_all(db)
+    .await
+    .unwrap()
+}
+
+/// Authors 2, 3 and 10, so that keys of one and two digits sort
+/// differently as numbers and as text, and a book by author 3 that authors
+/// 2 and 10 contributed to and that is tagged `Zebra` and `apple`, which
+/// sort differently by byte and by most collations.
+async fn contributed_book(db: &PgPool) -> Uuid {
+    sqlx::query("INSERT INTO library_author (id, name) VALUES (2, 'Ann'), (3, 'Bob'), (10, 'Cy')")
+        .execute(db)
+        .await
+        .unwrap();
+    tag(db, "Zebra", "Zebra").await;
+    tag(db, "apple", "Apple").await;
+    let dune = book(db, "Dune", "novel", 3, None).await;
+    contribute(db, dune, 2).await;
+    contribute(db, dune, 10).await;
+    tag_book(db, dune, "Zebra").await;
+    tag_book(db, dune, "apple").await;
+    dune
+}
+
 async fn history(db: &PgPool) -> Vec<(String, String, String, String)> {
     sqlx::query_as("SELECT model, key, kind, message FROM console_history ORDER BY id")
         .fetch_all(db)
@@ -1113,6 +1177,74 @@ async fn add_change_and_delete_are_recorded_in_history(db: PgPool) {
         root.get("/admin/library/book/42/change/").await.status,
         StatusCode::NOT_FOUND
     );
+}
+
+#[sqlx::test(migrations = "tests/migrations")]
+async fn an_unchanged_many_to_many_selection_is_not_a_change(db: PgPool) {
+    let dune = contributed_book(&db).await;
+    let root = Client::new(app(db.clone(), SignIn::Password, true), Some("root"));
+    let url = format!("/admin/library/book/{dune}/change/");
+
+    let page = root.get(&url).await;
+    assert!(
+        page.body
+            .contains("<option value=\"2\" selected>Ann</option>")
+    );
+    assert!(
+        page.body
+            .contains("<option value=\"10\" selected>Cy</option>")
+    );
+
+    // The same selections, in either order, with only the title changed.
+    for (title, first, second) in [("Dune Messiah", "2", "10"), ("Children of Dune", "10", "2")] {
+        let changed = root
+            .post(
+                &url,
+                &[
+                    ("title", title),
+                    ("genre", "novel"),
+                    ("published", ""),
+                    ("author", "3"),
+                    ("editor", ""),
+                    ("tags", "apple"),
+                    ("tags", "Zebra"),
+                    ("contributors", first),
+                    ("contributors", second),
+                ],
+            )
+            .await;
+        assert_eq!(changed.status, StatusCode::SEE_OTHER, "{}", changed.body);
+    }
+    assert_eq!(contributors(&db, dune).await, [2, 10]);
+    let messages: Vec<String> = history(&db).await.into_iter().map(|row| row.3).collect();
+    assert_eq!(messages, ["Changed Title.", "Changed Title."]);
+}
+
+#[sqlx::test(migrations = "tests/migrations")]
+async fn removing_a_many_to_many_key_is_a_change(db: PgPool) {
+    let dune = contributed_book(&db).await;
+    let root = Client::new(app(db.clone(), SignIn::Password, true), Some("root"));
+    let changed = root
+        .post(
+            &format!("/admin/library/book/{dune}/change/"),
+            &[
+                ("title", "Dune"),
+                ("genre", "novel"),
+                ("published", ""),
+                ("author", "3"),
+                ("editor", ""),
+                ("tags", "Zebra"),
+                ("tags", "apple"),
+                ("contributors", "2"),
+            ],
+        )
+        .await;
+    assert_eq!(changed.status, StatusCode::SEE_OTHER, "{}", changed.body);
+    assert_eq!(contributors(&db, dune).await, [2]);
+    let recorded = history(&db).await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].2, "changed");
+    assert_eq!(recorded[0].3, "Changed Contributors.");
 }
 
 #[sqlx::test(migrations = "tests/migrations")]

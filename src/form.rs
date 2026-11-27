@@ -1,5 +1,6 @@
 //! The add, change and delete pages.
 
+use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use axum::{
@@ -189,6 +190,20 @@ fn same(kind: Kind, old: Option<&str>, new: Option<&str>) -> bool {
         },
         (a, b) => a == b,
     }
+}
+
+/// Whether two many-to-many selections hold the same keys of `kind`. Both
+/// are compared as sets of parsed keys, so neither their order (`2` before
+/// `10` or after it) nor the spelling of a key (`0A…` or `0a…`) counts as a
+/// change. A value that is not a key of `kind` is kept as its text, so it
+/// still differs from every key.
+fn same_keys(kind: KeyKind, old: &[String], new: &[String]) -> bool {
+    let set = |ids: &[String]| -> BTreeSet<Result<Key, String>> {
+        ids.iter()
+            .map(|v| kind.parse(v).ok_or_else(|| v.clone()))
+            .collect()
+    };
+    set(old) == set(new)
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,11 +1356,13 @@ pub async fn change(
             .m2m
             .iter()
             .filter(|(n, ids)| {
-                old_m2m
+                let kind = model
+                    .m2m_field(n)
+                    .map_or(KeyKind::Text, |m| console.table_key(m.target).kind);
+                !old_m2m
                     .iter()
                     .find(|(o, _)| o == n)
-                    .map(|(_, old_ids)| old_ids)
-                    != Some(ids)
+                    .is_some_and(|(_, old_ids)| same_keys(kind, old_ids, ids))
             })
             .map(|(n, _)| *n)
             .collect();
@@ -1675,6 +1692,36 @@ mod tests {
         );
         assert!(parse(&field, Some("1.234"), KeyKind::Int).is_err());
         assert!(same(Kind::Decimal(2), Some("600.00"), Some("600")));
+    }
+
+    #[test]
+    fn selections_compare_as_sets_of_keys() {
+        let texts = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let int = KeyKind::Int;
+        assert!(same_keys(int, &texts(&["10", "2"]), &texts(&["2", "10"])));
+        assert!(same_keys(int, &texts(&[]), &texts(&[])));
+        assert!(!same_keys(int, &texts(&["2", "10"]), &texts(&["2"])));
+        assert!(!same_keys(int, &texts(&["2"]), &texts(&["2", "10"])));
+        assert!(!same_keys(int, &texts(&["2"]), &texts(&["3"])));
+        let text = KeyKind::Text;
+        assert!(same_keys(
+            text,
+            &texts(&["apple", "Zebra"]),
+            &texts(&["Zebra", "apple"])
+        ));
+        assert!(!same_keys(text, &texts(&["a"]), &texts(&["A"])));
+        // A saved value that is not a key still differs from no selection.
+        assert!(!same_keys(text, &texts(&[""]), &texts(&[])));
+        let uuid = KeyKind::Uuid;
+        let one = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let two = "0a1b2c3d-0000-4000-8000-000000000001";
+        assert!(same_keys(uuid, &texts(&[one, two]), &texts(&[two, one])));
+        assert!(same_keys(
+            uuid,
+            &texts(&[two]),
+            &texts(&[&two.to_uppercase()])
+        ));
+        assert!(!same_keys(uuid, &texts(&[one, two]), &texts(&[one])));
     }
 
     #[test]
