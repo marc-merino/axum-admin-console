@@ -150,6 +150,8 @@ app.
 - `.sign_in_url(url, param)`: unauthenticated requests are redirected to
   your page with the return path in `param`; `.sign_out_url(url)` makes "Log
   out" a link.
+- `.sign_in_page(url)`: the same redirect without a return path, for a
+  sign-in page that cannot come back to the console.
 - Neither: unauthenticated requests get a 403 page.
 
 ### `History` (optional)
@@ -198,6 +200,30 @@ time zone. Link to the page from the index with
 `.index_link(label, url, |perms| ...)`. Host handlers keep their own state
 (`State<MyState>`).
 
+### Unknown console paths
+
+A `/admin/...` path that no console route matches, or a method its route
+does not take, reaches the host's fallback. To answer it with the console's
+404 page (with its security headers) instead of the host's own:
+
+```rust
+let console = console.clone();
+let app = Router::new()
+    .merge(console.router())
+    .fallback(move |req: axum::extract::Request| {
+        let console = console.clone();
+        async move {
+            if req.uri().path() == "/admin" || req.uri().path().starts_with("/admin/") {
+                return console.error_page(AdminError::NotFound);
+            }
+            host_fallback(req).await
+        }
+    });
+```
+
+Set the same handler as `method_not_allowed_fallback`. `error_page` renders
+any `AdminError` the way the console's own pages do.
+
 ## Settings
 
 | Builder method | Default | |
@@ -217,14 +243,31 @@ itself keeps its own value.
 ## The registry
 
 Field kinds: `char`, `text`, `int`, `decimal`, `float`, `bool`, `datetime`,
-`date`, `duration`, `json`, `choice(name, label, &[(value, label)])`,
-`fk(name, column, label, table)` and `Kind::Password`, with `.null()`,
+`utc_timestamp`, `date`, `duration`, `json`,
+`choice(name, label, &[(value, label)])`, `fk(name, column, label, table)`
+and `Kind::Password`, with `.null()`,
 `.blank()`, `.default(..)`, `.default_sql(..)`, `.default_gen(..)`,
 `.help(..)`, `.auto_now_add()`, `.auto_now()`. Also on `Model`:
 `.fieldsets`, `.add_fieldsets`, `.readonly`, `.m2m`, `.computed`, `.inlines`,
 `.per_page`, `.date_hierarchy`, `.after_save` (code Django runs in `save()`
 or a signal), `.create_with` (Django's `save_model` taking over an add),
-`.no_add()`, `.no_change()`, `.no_delete()`, `.no_delete_selected()`.
+`.no_add()`, `.no_change()`, `.no_delete()`, `.no_delete_selected()`,
+`.count_limit(n)`.
+
+- `datetime` is a `timestamptz`; `utc_timestamp` is a
+  `timestamp without time zone` holding UTC (what Ecto's `:utc_datetime` and
+  many ORMs store). Both are shown, filtered and edited in the console's time
+  zone, whatever the database session's time zone is.
+- A `char` field can show any column through a text cast: a uuid that is not
+  a key, an array, a Postgres enum. The forms cannot write such columns, so
+  declare them `.readonly`, or give the model no add and no change. A
+  `choice` filter compares as text, so it works over an enum column too
+  (shown read-only). `bytea` has no kind; leave such columns out.
+- `.count_limit(n)` stops the change list counting at `n` rows: it shows
+  "More than n" and pages only through the first `n`. Use it on tables too
+  big to count on every page view.
+- A model without change permission, or declared `.no_change()`, shows the
+  change page read-only ("View …"), with no Save or Delete.
 
 ### Columns
 

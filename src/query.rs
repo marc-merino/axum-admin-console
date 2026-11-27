@@ -126,6 +126,15 @@ pub fn as_text(expr: &str, kind: Kind, tz: Tz) -> String {
                 tz.name()
             )
         }
+        // The first AT TIME ZONE reads the stored value as UTC (giving a
+        // timestamptz), the second shows it in `tz`: no step depends on the
+        // session's TimeZone.
+        Kind::UtcTimestamp => {
+            format!(
+                "to_char(({expr}) AT TIME ZONE 'UTC' AT TIME ZONE '{}', 'YYYY-MM-DD\"T\"HH24:MI:SS')",
+                tz.name()
+            )
+        }
         Kind::Duration => format!("floor(extract(epoch FROM ({expr})))::bigint::text"),
         _ => format!("({expr})::text"),
     }
@@ -152,6 +161,9 @@ pub fn cast_param(console: &Console, kind: Kind, placeholder: &str) -> String {
             "({placeholder}::timestamp AT TIME ZONE '{}')",
             console.time_zone().name()
         ),
+        Kind::UtcTimestamp => {
+            utc_from_local(console.time_zone(), &format!("{placeholder}::timestamp"))
+        }
         Kind::Date => format!("{placeholder}::date"),
         // Whole seconds, stored as Python's timedelta: days, then 0..86400 seconds.
         Kind::Duration => format!(
@@ -162,6 +174,23 @@ pub fn cast_param(console: &Console, kind: Kind, placeholder: &str) -> String {
         Kind::Char | Kind::Text | Kind::Choice(_) | Kind::Password => {
             format!("{placeholder}::text")
         }
+    }
+}
+
+/// `local`, a `timestamp` read in time zone `tz`, as the `timestamp` in UTC
+/// a [`Kind::UtcTimestamp`] column stores.
+pub(crate) fn utc_from_local(tz: Tz, local: &str) -> String {
+    format!(
+        "(({local} AT TIME ZONE '{}') AT TIME ZONE 'UTC')",
+        tz.name()
+    )
+}
+
+/// What an `auto_now` field of `kind` is set to.
+pub(crate) fn now(kind: Kind) -> &'static str {
+    match kind {
+        Kind::UtcTimestamp => "(now() AT TIME ZONE 'UTC')",
+        _ => "now()",
     }
 }
 

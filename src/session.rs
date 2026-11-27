@@ -112,7 +112,11 @@ impl Console {
                     Redirect::to(&format!("/admin/login/?next={}", html::url_value(&next)))
                         .into_response()
                 }
-                SignIn::Url { url, param } => {
+                SignIn::Url { url, param: None } => Redirect::to(url).into_response(),
+                SignIn::Url {
+                    url,
+                    param: Some(param),
+                } => {
                     let separator = if url.contains('?') { '&' } else { '?' };
                     Redirect::to(&format!(
                         "{url}{separator}{}={}",

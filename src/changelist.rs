@@ -180,6 +180,11 @@ fn date_bound(
     let p = params.push(value.to_string());
     Some(match kind {
         Kind::Date => format!("{column} {op} {p}::date"),
+        // The column stays bare so an index on it serves the range.
+        Kind::UtcTimestamp => format!(
+            "{column} {op} {}",
+            query::utc_from_local(tz, &format!("{p}::date::timestamp"))
+        ),
         _ => format!(
             "{column} {op} ({p}::date::timestamp AT TIME ZONE '{}')",
             tz.name()
@@ -258,7 +263,11 @@ async fn build_filters(
                             if key.ends_with("__isnull") {
                                 return null_condition(&column, value);
                             }
-                            Some(format!("{column} = {}", params.push(value.to_string())))
+                            // Compared as text, so a Postgres enum column works too.
+                            Some(format!(
+                                "{column}::text = {}",
+                                params.push(value.to_string())
+                            ))
                         });
                     }
                     Kind::ForeignKey(table) => {
@@ -281,7 +290,7 @@ async fn build_filters(
                             ))
                         });
                     }
-                    Kind::DateTime | Kind::Date => {
+                    Kind::DateTime | Kind::UtcTimestamp | Kind::Date => {
                         let gte = format!("{name}__gte");
                         let lt = format!("{name}__lt");
                         let options = date_options(tz, &gte, &lt, &isnull, field.null);
@@ -542,6 +551,11 @@ fn hierarchy(
     let field = model.field(model.date_hierarchy?)?;
     let local = match field.kind {
         Kind::Date => format!("t.{}", field.column),
+        Kind::UtcTimestamp => format!(
+            "(t.{} AT TIME ZONE 'UTC' AT TIME ZONE '{}')",
+            field.column,
+            console.time_zone().name()
+        ),
         _ => format!(
             "(t.{} AT TIME ZONE '{}')",
             field.column,
@@ -622,20 +636,22 @@ pub async fn page(
     }));
     order_sql.push(format!("t.{} DESC", model.pk));
 
-    let count_sql = format!("SELECT count(*) FROM {} t {where_sql}", model.table);
+    let count_sql = count_query(model, &where_sql);
     let count: i64 = sqlx::query_scalar(&count_sql)
         .bind_all_text(&params)
         .fetch_one(&mut *db)
         .await?;
     let total: i64 = if filtered {
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {}", model.table))
+        sqlx::query_scalar(&count_query(model, ""))
             .fetch_one(&mut *db)
             .await?
     } else {
         count
     };
     let per_page = model.per_page.max(1);
-    let pages = ((count + per_page - 1) / per_page).max(1);
+    // Past the count limit only the first `limit` rows are paged.
+    let pageable = model.count_limit.map_or(count, |limit| count.min(limit));
+    let pages = ((pageable + per_page - 1) / per_page).max(1);
     let page_number = query
         .get("p")
         .and_then(|p| p.parse::<i64>().ok())
@@ -829,8 +845,10 @@ pub async fn page(
             .collect();
         let counts = if filtered {
             format!(
-                " <span class=\"small quiet\">{count} result{} (<a href=\"?\">{total} total</a>)</span>",
-                if count == 1 { "" } else { "s" }
+                " <span class=\"small quiet\">{} result{} (<a href=\"?\">{} total</a>)</span>",
+                shown_count(model, count),
+                if count == 1 { "" } else { "s" },
+                shown_count(model, total)
             )
         } else {
             String::new()
@@ -876,7 +894,12 @@ pub async fn page(
     } else {
         model.plural
     };
-    let _ = write!(content, "{count} {}</p></form></div>", esc(noun));
+    let _ = write!(
+        content,
+        "{} {}</p></form></div>",
+        shown_count(model, count),
+        esc(noun)
+    );
     if !boxes.is_empty() {
         content.push_str("<nav id=\"changelist-filter\" aria-labelledby=\"changelist-filter-header\"><h2 id=\"changelist-filter-header\">Filter</h2>");
         if filtered
@@ -924,6 +947,27 @@ pub async fn page(
         "change-list",
         &content,
     ))
+}
+
+/// Counts the rows matching `where_sql`, or with a count limit at most one
+/// more than the limit, so a large table is never counted whole.
+fn count_query(model: &Model, where_sql: &str) -> String {
+    match model.count_limit {
+        Some(limit) => format!(
+            "SELECT count(*) FROM (SELECT 1 FROM {} t {where_sql} LIMIT {}) c",
+            model.table,
+            limit.max(0) + 1
+        ),
+        None => format!("SELECT count(*) FROM {} t {where_sql}", model.table),
+    }
+}
+
+/// A count as the page shows it: "More than 10000" past the count limit.
+fn shown_count(model: &Model, count: i64) -> String {
+    match model.count_limit {
+        Some(limit) if count > limit => format!("More than {limit}"),
+        _ => count.to_string(),
+    }
 }
 
 /// The script that checks every row box when the header box is checked.

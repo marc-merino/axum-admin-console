@@ -39,6 +39,11 @@ pub enum Kind {
     Bool,
     /// `timestamptz`, shown and edited in the console's time zone.
     DateTime,
+    /// `timestamp without time zone` holding UTC (what Ecto's
+    /// `:utc_datetime` and many ORMs store), shown and edited in the
+    /// console's time zone like [`Kind::DateTime`], whatever the database
+    /// session's time zone.
+    UtcTimestamp,
     Date,
     /// `DurationField` (`interval`), written like Django's `duration_string`.
     Duration,
@@ -128,6 +133,10 @@ impl Field {
     }
     pub const fn datetime(name: &'static str, label: &'static str) -> Self {
         Self::new(name, label, Kind::DateTime)
+    }
+    /// A `timestamp without time zone` column holding UTC.
+    pub const fn utc_timestamp(name: &'static str, label: &'static str) -> Self {
+        Self::new(name, label, Kind::UtcTimestamp)
     }
     pub const fn date(name: &'static str, label: &'static str) -> Self {
         Self::new(name, label, Kind::Date)
@@ -536,6 +545,9 @@ pub struct Model {
     /// Empty: newest primary key first.
     pub ordering: &'static [Sort],
     pub per_page: i64,
+    /// Count at most this many rows for the change list (see
+    /// [`Model::count_limit`]); `None` counts them all.
+    pub count_limit: Option<i64>,
     pub date_hierarchy: Option<&'static str>,
     pub actions: &'static [Action],
     pub exports: &'static [Export],
@@ -578,6 +590,7 @@ impl Model {
             search: &[],
             ordering: &[],
             per_page: 100,
+            count_limit: None,
             date_hierarchy: None,
             actions: &[],
             exports: &[],
@@ -645,6 +658,14 @@ impl Model {
     }
     pub const fn per_page(mut self, per_page: i64) -> Self {
         self.per_page = per_page;
+        self
+    }
+    /// For large tables: the change list counts at most `limit` matching
+    /// rows, says "More than `limit`" beyond that and pages through the
+    /// first `limit` rows only (search and filters reach the others), so a
+    /// page never counts the whole table.
+    pub const fn count_limit(mut self, limit: i64) -> Self {
+        self.count_limit = Some(limit);
         self
     }
     pub const fn date_hierarchy(mut self, field: &'static str) -> Self {

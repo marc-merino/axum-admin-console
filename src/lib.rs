@@ -60,10 +60,11 @@ pub struct Console(Arc<Inner>);
 pub(crate) enum SignIn {
     /// The console's own form, checked by the host.
     Password(Box<dyn PasswordSignIn>),
-    /// The host's page: `url` with `param` set to the console path to return to.
+    /// The host's page: `url`, with `param` (when given) set to the console
+    /// path to return to.
     Url {
         url: String,
-        param: String,
+        param: Option<String>,
     },
     None,
 }
@@ -311,6 +312,15 @@ impl Console {
             .layer(Extension(self.clone()))
     }
 
+    /// The console's page for `error`, with its security headers: what a
+    /// host answers itself for a request under [`BASE`] that no console
+    /// route matched (a fallback of its own, see `README.md`).
+    pub fn error_page(&self, error: AdminError) -> Response {
+        let mut response = self.error_response(error);
+        add_security_headers(&mut response);
+        response
+    }
+
     pub fn db(&self) -> &PgPool {
         &self.0.db
     }
@@ -393,7 +403,18 @@ impl ConsoleBuilder {
     pub fn sign_in_url(mut self, url: impl Into<String>, param: impl Into<String>) -> Self {
         self.inner.sign_in = SignIn::Url {
             url: url.into(),
-            param: param.into(),
+            param: Some(param.into()),
+        };
+        self
+    }
+
+    /// The host's sign-in page, for a host whose sign-in cannot return to
+    /// the console: an unauthenticated request is redirected to `url` as it
+    /// is, without a return path.
+    pub fn sign_in_page(mut self, url: impl Into<String>) -> Self {
+        self.inner.sign_in = SignIn::Url {
+            url: url.into(),
+            param: None,
         };
         self
     }
@@ -537,11 +558,15 @@ async fn render_errors(State(console): State<Console>, mut response: Response) -
         Some(error) => console.error_response(error),
         None => response,
     };
+    add_security_headers(&mut response);
+    response
+}
+
+fn add_security_headers(response: &mut Response) {
     for (name, value) in SECURITY_HEADERS {
         response
             .headers_mut()
             .entry(name)
             .or_insert(axum::http::HeaderValue::from_static(value));
     }
-    response
 }

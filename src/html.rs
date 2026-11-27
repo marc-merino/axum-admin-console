@@ -149,9 +149,11 @@ pub fn display(kind: Kind, value: Option<&str>, list: bool) -> String {
             .iter()
             .find(|(stored, _)| *stored == value)
             .map_or(value, |(_, label)| label)),
-        Kind::DateTime => NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
-            .map(|at| esc(&django_datetime(at)))
-            .unwrap_or_else(|_| esc(value)),
+        Kind::DateTime | Kind::UtcTimestamp => {
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
+                .map(|at| esc(&django_datetime(at)))
+                .unwrap_or_else(|_| esc(value))
+        }
         Kind::Date => NaiveDate::parse_from_str(value, "%Y-%m-%d")
             .map(|day| esc(&django_date(day)))
             .unwrap_or_else(|_| esc(value)),

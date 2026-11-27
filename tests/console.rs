@@ -8,13 +8,13 @@ use axum::{
     body::Body,
     extract::State,
     http::{HeaderMap, HeaderValue, Request, StatusCode, header, request::Parts},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use axum_admin_console::{
-    AdminResult, Auth, Change, Console, Entry, EntryKind, Event, Form, History, Identity, Key,
-    KeyKind, OnDelete, Pages, PasswordSignIn, Perms, Relation, Schema, SignInOutcome, Staff,
-    StaffMember, csrf,
+    AdminError, AdminResult, Auth, Change, Console, Entry, EntryKind, Event, Form, History,
+    Identity, Key, KeyKind, OnDelete, Pages, PasswordSignIn, Perms, Relation, Schema,
+    SignInOutcome, Staff, StaffMember, Tz, csrf,
     html::esc,
     registry::{
         Action, App, BoxFuture, Column, Computed, ComputedRender, Download, Export, Field,
@@ -123,10 +123,41 @@ static TAG: Model = Model::new("library", "tag", "library_tag", "tag", "tags")
     .list_display(&[Column::field("code"), Column::field("label")])
     .ordering(&[Sort::asc(Path::col("code"))]);
 
+const LOAN_STATES: &[(&str, &str)] =
+    &[("open", "Open"), ("returned", "Returned"), ("lost", "Lost")];
+
+/// A `timestamp without time zone` holding UTC, an enum, and columns shown
+/// through a text cast (a uuid, a text array); `digest` is never declared.
+static LOAN: Model = Model::new("library", "loan", "library_loan", "loan", "loans")
+    .key(KeyKind::Uuid)
+    .repr("'Loan of ' || (SELECT b.title FROM library_book b WHERE b.id = {t}.book_id)")
+    .fields(&[
+        Field::fk("book", "book_id", "Book", "library_book"),
+        Field::choice("state", "State", LOAN_STATES),
+        Field::utc_timestamp("lent_at", "Lent at"),
+        Field::utc_timestamp("updated_at", "Updated at").auto_now(),
+        Field::char("reader", "Reader", 36).null(),
+        Field::char("tags", "Tags", 200),
+        Field::json("notes", "Notes"),
+    ])
+    .readonly(&["state", "reader", "tags", "notes", "updated_at"])
+    .list_display(&[
+        Column::field("book"),
+        Column::field("state"),
+        Column::field("lent_at"),
+        Column::field("reader"),
+        Column::field("tags"),
+    ])
+    .list_filter(&[Filter::Field("state"), Filter::Field("lent_at")])
+    .date_hierarchy("lent_at")
+    .ordering(&[Sort::desc(Path::col("lent_at"))])
+    .per_page(2)
+    .count_limit(3);
+
 static APP: App = App {
     label: "library",
     name: "Library",
-    models: &[&AUTHOR, &BOOK, &TAG],
+    models: &[&AUTHOR, &BOOK, &TAG, &LOAN],
 };
 
 static RELATIONS: &[Relation] = &[
@@ -435,11 +466,18 @@ async fn run_report(staff: Staff, headers: HeaderMap, form: Form) -> AdminResult
 enum SignIn {
     Password,
     Url,
+    /// A sign-in page that cannot return to the console.
+    Page,
     None,
 }
 
 fn app(db: PgPool, sign_in: SignIn, history: bool) -> Router {
+    app_in(db, sign_in, history, Tz::UTC)
+}
+
+fn app_in(db: PgPool, sign_in: SignIn, history: bool, time_zone: Tz) -> Router {
     let mut builder = Console::builder(db, &SCHEMA, CookieAuth)
+        .time_zone(time_zone)
         .site_title("Library administration")
         .site_header("Library")
         .index_link("Reports", "/admin/reports/", |_| true);
@@ -448,6 +486,7 @@ fn app(db: PgPool, sign_in: SignIn, history: bool) -> Router {
         SignIn::Url => builder
             .sign_in_url("/accounts/sign-in", "return")
             .sign_out_url("/accounts/sign-out"),
+        SignIn::Page => builder.sign_in_page("/accounts/sign-in"),
         SignIn::None => builder,
     };
     if history {
@@ -1461,4 +1500,377 @@ async fn host_pages_get_the_console_chrome_and_checks(db: PgPool) {
         visitor.get("/admin/reports/").await.status,
         StatusCode::FORBIDDEN
     );
+}
+
+// ---------------------------------------------------------------------------
+// A sign-in page without a return path
+
+#[sqlx::test(migrations = "tests/migrations")]
+async fn a_sign_in_page_gets_no_return_path(db: PgPool) {
+    let anonymous = Client::new(app(db.clone(), SignIn::Page, true), None);
+    for uri in ["/admin/", "/admin/library/book/?q=x"] {
+        let reply = anonymous.get(uri).await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{uri}");
+        assert_eq!(reply.location(), "/accounts/sign-in", "{uri}");
+    }
+    let someone = Client::new(app(db, SignIn::Page, true), Some("someone"));
+    let refused = someone.get("/admin/").await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert!(refused.body.contains("You are authenticated as someone"));
+}
+
+// ---------------------------------------------------------------------------
+// View-only staff
+
+#[sqlx::test(migrations = "tests/migrations")]
+async fn view_only_staff_read_and_every_write_is_refused(db: PgPool) {
+    let ann = author(&db, "Ann").await;
+    let dune = book(&db, "Dune", "novel", ann, None).await;
+    let dune_text = dune.to_string();
+    let ann_text = ann.to_string();
+    let reader = Client::new(app(db.clone(), SignIn::Password, true), Some("reader"));
+
+    let list = reader.get("/admin/library/book/").await;
+    assert_eq!(list.status, StatusCode::OK);
+    assert!(list.body.contains("Dune"));
+    // Exports need only the view permission; nothing that writes is offered.
+    assert!(list.body.contains("value=\"export_keys\""));
+    assert!(!list.body.contains("value=\"delete_selected\""));
+    assert!(!list.body.contains("value=\"make_classic\""));
+    assert!(!list.body.contains("/admin/library/book/add/"));
+
+    let page = reader
+        .get(&format!("/admin/library/book/{dune}/change/"))
+        .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("View book"));
+    assert!(page.body.contains("<div class=\"readonly\">Dune</div>"));
+    assert!(!page.body.contains("<form method=\"post\" id=\"book_form\""));
+    assert!(!page.body.contains("name=\"_save\""));
+    assert!(!page.body.contains("../delete/"));
+
+    let form = [
+        ("title", "Changed"),
+        ("genre", "poetry"),
+        ("author", ann_text.as_str()),
+    ];
+    for (uri, fields) in [
+        ("/admin/library/book/add/".to_string(), form.to_vec()),
+        (format!("/admin/library/book/{dune}/change/"), form.to_vec()),
+        (
+            format!("/admin/library/book/{dune}/delete/"),
+            vec![("post", "yes")],
+        ),
+        (
+            "/admin/library/book/".to_string(),
+            vec![
+                ("action", "delete_selected"),
+                ("post", "yes"),
+                ("_selected_action", dune_text.as_str()),
+            ],
+        ),
+        (
+            "/admin/library/book/".to_string(),
+            vec![
+                ("action", "make_classic"),
+                ("_selected_action", dune_text.as_str()),
+            ],
+        ),
+    ] {
+        let refused = reader.post(&uri, &fields).await;
+        assert_eq!(
+            refused.status,
+            StatusCode::FORBIDDEN,
+            "POST {uri} {fields:?}"
+        );
+    }
+    for uri in [
+        "/admin/library/book/add/".to_string(),
+        format!("/admin/library/book/{dune}/delete/"),
+    ] {
+        assert_eq!(
+            reader.get(&uri).await.status,
+            StatusCode::FORBIDDEN,
+            "{uri}"
+        );
+    }
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT title, genre FROM library_book")
+        .fetch_all(&db)
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![("Dune".to_string(), "novel".to_string())]);
+}
+
+// ---------------------------------------------------------------------------
+// Column types: UTC timestamps without time zone, enums, text casts
+
+async fn loan(db: &PgPool, book: Uuid, state: &str, lent_at: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO library_loan (book_id, state, lent_at, reader, tags, notes, digest) \
+         VALUES ($1, $2::library_loan_state, $3::timestamp, \
+                 '6f1c0d36-7d0e-4b5c-9a54-8f8b8f0c2a11', '{blue,red}', '{\"shelf\": 4}', '\\xdeadbeef') \
+         RETURNING id",
+    )
+    .bind(book)
+    .bind(state)
+    .bind(lent_at)
+    .fetch_one(db)
+    .await
+    .unwrap()
+}
+
+/// A pool on the same database whose sessions are not in UTC.
+async fn new_york_pool(db: &PgPool) -> PgPool {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET TIME ZONE 'America/New_York'")
+                    .execute(conn)
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .connect_with((*db.connect_options()).clone())
+        .await
+        .unwrap();
+    let zone: String = sqlx::query_scalar("SHOW timezone")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(zone, "America/New_York");
+    pool
+}
+
+#[sqlx::test(migrations = "tests/migrations")]
+async fn utc_timestamps_show_filter_and_sort_in_the_console_time_zone(db: PgPool) {
+    let ann = author(&db, "Ann").await;
+    // UTC instants; in Madrid (UTC+2 in July) Alpha and Gamma fall on July 1
+    // and Beta on July 2.
+    let alpha = book(&db, "Alpha", "novel", ann, None).await;
+    let beta = book(&db, "Beta", "novel", ann, None).await;
+    let gamma = book(&db, "Gamma", "novel", ann, None).await;
+    loan(&db, alpha, "open", "2026-06-30 23:30:00").await;
+    loan(&db, beta, "open", "2026-07-01 22:30:00").await;
+    let noon = loan(&db, gamma, "open", "2026-07-01 10:00:00").await;
+    let madrid: Tz = "Europe/Madrid".parse().unwrap();
+
+    for pool in [db.clone(), new_york_pool(&db).await] {
+        let root = Client::new(app_in(pool, SignIn::Password, true, madrid), Some("root"));
+
+        let page = root
+            .get(&format!("/admin/library/loan/{noon}/change/"))
+            .await;
+        assert_eq!(page.status, StatusCode::OK);
+        assert!(
+            page.body.contains("value=\"2026-07-01T12:00:00\""),
+            "{}",
+            page.body
+        );
+
+        // Newest first; two per page.
+        let list = root.get("/admin/library/loan/").await;
+        assert!(
+            list.body.contains("July 2, 2026, 12:30 a.m."),
+            "{}",
+            list.body
+        );
+        assert!(list.body.contains("July 1, 2026, noon"));
+        assert!(position(&list.body, "Beta") < position(&list.body, "Gamma"));
+        assert!(!list.body.contains("Alpha"));
+
+        // Sorted by the column, oldest first.
+        let sorted = root.get("/admin/library/loan/?o=3").await;
+        assert!(sorted.body.contains("July 1, 2026, 1:30 a.m."));
+        assert!(position(&sorted.body, "Alpha") < position(&sorted.body, "Gamma"));
+        assert!(!sorted.body.contains("Beta"));
+
+        // Days are Madrid days, for the date filter and the date hierarchy.
+        for query in [
+            "lent_at__gte=2026-07-01&lent_at__lt=2026-07-02",
+            "lent_at__year=2026&lent_at__month=7&lent_at__day=1",
+        ] {
+            let day = root.get(&format!("/admin/library/loan/?{query}")).await;
+            assert_eq!(day.status, StatusCode::OK, "{query}");
+            assert!(
+                day.body.contains("Alpha") && day.body.contains("Gamma"),
+                "{query}"
+            );
+            assert!(!day.body.contains("Beta"), "{query}");
+        }
+        let june = root
+            .get("/admin/library/loan/?lent_at__year=2026&lent_at__month=6")
+            .await;
+        assert!(june.body.contains("0 loans"), "{}", june.body);
+        let july = root
+            .get("/admin/library/loan/?lent_at__year=2026&lent_at__month=7")
+            .await;
+        assert!(july.body.contains("lent_at__day=1"));
+        assert!(july.body.contains("lent_at__day=2"));
+    }
+}
+
+#[sqlx::test(migrations = "tests/migrations")]
+async fn utc_timestamps_are_edited_in_the_console_time_zone(db: PgPool) {
+    let ann = author(&db, "Ann").await;
+    let dune = book(&db, "Dune", "novel", ann, None).await;
+    let lent = loan(&db, dune, "open", "2026-07-01 10:00:00").await;
+    sqlx::query("UPDATE library_loan SET updated_at = '2000-01-01'")
+        .execute(&db)
+        .await
+        .unwrap();
+    let madrid: Tz = "Europe/Madrid".parse().unwrap();
+    let root = Client::new(
+        app_in(new_york_pool(&db).await, SignIn::Password, true, madrid),
+        Some("root"),
+    );
+    let dune_text = dune.to_string();
+    let saved = root
+        .post(
+            &format!("/admin/library/loan/{lent}/change/"),
+            &[
+                ("book", dune_text.as_str()),
+                ("lent_at", "2026-07-01T14:00:00"),
+                ("_save", "Save"),
+            ],
+        )
+        .await;
+    assert_eq!(saved.status, StatusCode::SEE_OTHER, "{}", saved.body);
+    let (lent_at, updated_at): (chrono::NaiveDateTime, chrono::NaiveDateTime) =
+        sqlx::query_as("SELECT lent_at, updated_at FROM library_loan")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(lent_at.to_string(), "2026-07-01 12:00:00");
+    let drift = (chrono::Utc::now().naive_utc() - updated_at)
+        .num_seconds()
+        .abs();
+    assert!(drift < 120, "auto_now stored {updated_at}, not UTC now");
+}
+
+#[sqlx::test(migrations = "tests/migrations")]
+async fn enum_uuid_array_and_json_columns_show_and_filter(db: PgPool) {
+    let ann = author(&db, "Ann").await;
+    let alpha = book(&db, "Alpha", "novel", ann, None).await;
+    let beta = book(&db, "Beta", "novel", ann, None).await;
+    let lost = loan(&db, alpha, "lost", "2026-07-01 10:00:00").await;
+    loan(&db, beta, "returned", "2026-07-02 10:00:00").await;
+    let root = Client::new(app(db.clone(), SignIn::Password, true), Some("root"));
+
+    let list = root.get("/admin/library/loan/?state__exact=lost").await;
+    assert_eq!(list.status, StatusCode::OK, "{}", list.body);
+    assert!(list.body.contains("Alpha") && !list.body.contains("Beta"));
+    assert!(list.body.contains("<td>Lost</td>"));
+    assert!(list.body.contains("6f1c0d36-7d0e-4b5c-9a54-8f8b8f0c2a11"));
+    assert!(list.body.contains("{blue,red}"));
+
+    let page = root
+        .get(&format!("/admin/library/loan/{lost}/change/"))
+        .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("Loan of Alpha"));
+    assert!(page.body.contains("&quot;shelf&quot;: 4"));
+    assert!(!page.body.contains("deadbeef") && !page.body.contains("digest"));
+}
+
+#[sqlx::test(migrations = "tests/migrations")]
+async fn a_count_limit_never_counts_past_it(db: PgPool) {
+    let ann = author(&db, "Ann").await;
+    let dune = book(&db, "Dune", "novel", ann, None).await;
+    for day in 1..=5 {
+        let state = if day == 5 { "lost" } else { "open" };
+        loan(&db, dune, state, &format!("2026-07-0{day} 10:00:00")).await;
+    }
+    let root = Client::new(app(db, SignIn::Password, true), Some("root"));
+
+    let list = root.get("/admin/library/loan/").await;
+    assert!(list.body.contains("More than 3 loans"), "{}", list.body);
+    // Two per page: the first three rows are on pages 1 and 2.
+    assert!(list.body.contains("p=2") && !list.body.contains("p=3"));
+    let past = root.get("/admin/library/loan/?p=3").await;
+    assert!(past.body.contains("<span class=\"this-page\">2</span>"));
+
+    let open = root.get("/admin/library/loan/?state__exact=open").await;
+    assert!(open.body.contains("More than 3 loans</p>"), "{}", open.body);
+    let lost = root.get("/admin/library/loan/?state__exact=lost").await;
+    assert!(lost.body.contains("1 loan</p>"));
+
+    // With search, the toolbar shows both counts, each limited.
+    let searched = root.get("/admin/library/book/?q=Dune").await;
+    assert!(
+        searched
+            .body
+            .contains("1 result (<a href=\"?\">1 total</a>)")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A host fallback answering the rest of /admin with the console's page
+
+#[sqlx::test(migrations = "tests/migrations")]
+async fn a_host_fallback_answers_unknown_console_paths_with_the_console_page(db: PgPool) {
+    let ann = author(&db, "Ann").await;
+    let dune = book(&db, "Dune", "novel", ann, None).await;
+    let console = Console::builder(db, &SCHEMA, CookieAuth).build();
+    // The host's fallback, also for a known path with a method it lacks.
+    let fallback = {
+        let console = console.clone();
+        move |uri: axum::http::Uri| {
+            let console = console.clone();
+            async move {
+                let path = uri.path();
+                if path == "/admin" || path.starts_with("/admin/") {
+                    console.error_page(AdminError::NotFound)
+                } else {
+                    (StatusCode::IM_A_TEAPOT, "host").into_response()
+                }
+            }
+        }
+    };
+    let router: Router = console
+        .router()
+        .fallback(fallback.clone())
+        .method_not_allowed_fallback(fallback);
+    let root = Client::new(router, Some("root"));
+    for uri in [
+        "/admin/a/b/c/d/e",
+        &format!("/admin/library/book/{dune}/change/x/"),
+        "/admin/static/other.css",
+        "/admin/library/nothing/",
+    ] {
+        let reply = root.get(uri).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{uri}");
+        assert!(
+            reply
+                .body
+                .contains("The requested page or object does not exist.")
+        );
+        assert!(
+            reply.headers["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .starts_with("default-src 'none';")
+        );
+    }
+    let wrong_method = root
+        .send(
+            Request::delete("/admin/library/book/")
+                .header(header::HOST, "admin.test")
+                .header(header::COOKIE, root.cookies())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(wrong_method.status, StatusCode::NOT_FOUND);
+    assert!(wrong_method.headers.contains_key("content-security-policy"));
+    for uri in [
+        "/admin",
+        "/admin/",
+        "/admin/library/",
+        "/admin/library/book",
+        "/admin/static/admin.css",
+        &format!("/admin/library/book/{dune}/change/"),
+    ] {
+        assert_eq!(root.get(uri).await.status, StatusCode::OK, "{uri}");
+    }
+    assert_eq!(root.get("/elsewhere").await.status, StatusCode::IM_A_TEAPOT);
 }

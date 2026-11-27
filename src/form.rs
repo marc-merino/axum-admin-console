@@ -116,7 +116,7 @@ pub(crate) fn parse(
             "false" | "False" | "0" => "false".to_string(),
             _ => return Err("Select a valid choice.".to_string()),
         },
-        Kind::DateTime => [
+        Kind::DateTime | Kind::UtcTimestamp => [
             "%Y-%m-%dT%H:%M:%S",
             "%Y-%m-%dT%H:%M",
             "%Y-%m-%d %H:%M:%S",
@@ -340,7 +340,7 @@ async fn widget(
             };
             format!("<input type=\"checkbox\" name=\"{name}\" id=\"{id}\"{checked}>")
         }
-        Kind::DateTime => format!(
+        Kind::DateTime | Kind::UtcTimestamp => format!(
             "<input type=\"datetime-local\" step=\"1\" name=\"{name}\" id=\"{id}\" value=\"{text}\"{required}> <span class=\"timezonewarning\">{}</span>",
             esc(console.time_zone().name())
         ),
@@ -1107,7 +1107,7 @@ async fn insert(
     let mut exprs = Vec::new();
     for field in model.fields {
         let expr = if field.auto != Auto::None {
-            Some("now()".to_string())
+            Some(query::now(field.kind).to_string())
         } else if matches!(field.kind, Kind::Password) && submitted.password.is_some() {
             Some(cast_param(
                 console,
@@ -1177,7 +1177,7 @@ async fn update(
             .fields
             .iter()
             .filter(|f| f.auto == Auto::OnSave)
-            .map(|f| format!("{} = now()", f.column)),
+            .map(|f| format!("{} = {}", f.column, query::now(f.kind))),
     );
     if sets.is_empty() {
         return Ok(());
