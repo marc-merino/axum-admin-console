@@ -1,0 +1,29 @@
+[package]
+name = "axum-admin-console"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A Django-style admin console for axum and sqlx services on Postgres"
+
+[lib]
+name = "axum_admin_console"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+rand = "0.8"
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "chrono", "json", "uuid"] }
+subtle = "2"
+uuid = "1"
+
+[dev-dependencies]
+http-body-util = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "macros", "migrate", "postgres", "chrono", "json", "uuid"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
